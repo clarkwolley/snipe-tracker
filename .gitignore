@@ -30,6 +30,9 @@ data/*.parquet
 models/*.pkl
 models/*.joblib
 
+# Generated reports
+reports/
+
 # OS
 .DS_Store
 Thumbs.db

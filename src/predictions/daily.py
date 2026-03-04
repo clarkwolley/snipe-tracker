@@ -223,6 +223,12 @@ def run():
     pred_df = predict_tonight()
     if not pred_df.empty:
         print_top_picks(pred_df)
+
+        # Generate shareable HTML report
+        from src.predictions.report import generate_html_report
+        report_path = generate_html_report(pred_df)
+        print(f"\n🌐 Open in browser: file://{report_path}")
+
     return pred_df
 
 
