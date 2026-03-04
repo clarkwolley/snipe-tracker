@@ -33,3 +33,4 @@ models/*.joblib
 # OS
 .DS_Store
 Thumbs.db
+id_ed25519*
