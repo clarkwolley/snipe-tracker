@@ -39,13 +39,54 @@ def _tier_class(prob: float) -> str:
     return "longshot"
 
 
-def generate_html_report(pred_df: pd.DataFrame, top_n: int = 30) -> str:
+def _build_game_winner_html(game_df: pd.DataFrame) -> str:
+    """Build HTML section for game winner predictions."""
+    if game_df is None or game_df.empty:
+        return ""
+
+    rows_html = ""
+    for _, g in game_df.iterrows():
+        is_home_fav = g["home_win_prob"] > 50
+        winner = g["predicted_winner"]
+        conf = g["confidence"]
+
+        if conf >= 60:
+            conf_class = "fire"
+            conf_icon = "🟢"
+        elif conf >= 55:
+            conf_class = "strong"
+            conf_icon = "🟡"
+        else:
+            conf_class = "longshot"
+            conf_icon = "⚪"
+
+        venue_icon = "🏠" if is_home_fav else "✈️"
+        bar_width = g["home_win_prob"]
+
+        rows_html += f"""        <div class="game-winner-card {conf_class}">
+            <div class="gw-matchup">{g['away_team']} @ {g['home_team']}</div>
+            <div class="gw-pick">{conf_icon} {venue_icon} <strong>{winner}</strong> ({conf}%)</div>
+            <div class="gw-bar-container">
+                <div class="gw-bar-home" style="width: {bar_width}%">{g['home_team']} {g['home_win_prob']}%</div>
+                <div class="gw-bar-away" style="width: {100 - bar_width}%">{g['away_team']} {g['away_win_prob']}%</div>
+            </div>
+        </div>
+"""
+
+    return f"""        <h2>🏆 Game Winner Predictions</h2>
+        <div class="gw-grid">
+{rows_html}
+        </div>"""
+
+
+def generate_html_report(pred_df: pd.DataFrame, top_n: int = 30, game_df: pd.DataFrame = None) -> str:
     """
     Generate a full HTML report from prediction data.
 
     Args:
         pred_df: DataFrame from predict_tonight()
         top_n: Number of players to include
+        game_df: Optional DataFrame from predict_game_winners()
 
     Returns:
         Path to the generated HTML file.
@@ -242,6 +283,27 @@ def generate_html_report(pred_df: pd.DataFrame, top_n: int = 30) -> str:
         .team-col ol {{ padding-left: 1.2rem; }}
         .team-col li {{ margin-bottom: 0.3rem; font-size: 0.9rem; }}
         .pct {{ color: #22c55e; font-weight: 700; }}
+        .gw-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+            gap: 1rem;
+            margin-top: 1rem;
+        }}
+        .game-winner-card {{
+            background: #1a1f35;
+            border: 1px solid #2a3352;
+            border-radius: 12px;
+            padding: 1rem;
+        }}
+        .game-winner-card.fire {{ border-left: 3px solid #22c55e; }}
+        .game-winner-card.strong {{ border-left: 3px solid #f59e0b; }}
+        .game-winner-card.longshot {{ border-left: 3px solid #475569; }}
+        .gw-matchup {{ font-size: 1.1rem; font-weight: 700; margin-bottom: 0.4rem; }}
+        .gw-pick {{ font-size: 0.95rem; margin-bottom: 0.6rem; color: #94a3b8; }}
+        .gw-pick strong {{ color: #f1f5f9; }}
+        .gw-bar-container {{ display: flex; border-radius: 6px; overflow: hidden; height: 24px; font-size: 0.75rem; }}
+        .gw-bar-home {{ background: #3b82f6; color: #fff; display: flex; align-items: center; justify-content: center; font-weight: 600; }}
+        .gw-bar-away {{ background: #64748b; color: #fff; display: flex; align-items: center; justify-content: center; font-weight: 600; }}
         footer {{
             text-align: center;
             margin-top: 3rem;
@@ -290,6 +352,8 @@ def generate_html_report(pred_df: pd.DataFrame, top_n: int = 30) -> str:
         <div class="games-grid">
 {game_cards}
         </div>
+
+{_build_game_winner_html(game_df) if game_df is not None and not game_df.empty else ''}
 
         <footer>
             Snipe Tracker · Built with Python, scikit-learn & the NHL API<br>

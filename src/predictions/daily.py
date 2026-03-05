@@ -218,15 +218,92 @@ def print_top_picks(pred_df: pd.DataFrame, top_n: int = 25):
         print(f"  {matchup}: {names}")
 
 
+def predict_game_winners() -> pd.DataFrame:
+    """
+    Predict winners for tonight's games.
+
+    Returns:
+        DataFrame with one row per game, home win probability.
+    """
+    from src.models.game_model import load_game_model, predict_game_winner
+    from src.data.collector import get_standings_df
+    from src.features.team_features import build_team_strength
+
+    schedule = get_todays_games()
+    if schedule.empty:
+        return pd.DataFrame()
+
+    today = schedule[schedule["date"] == schedule["date"].min()]
+
+    try:
+        model, scaler, meta = load_game_model()
+    except FileNotFoundError:
+        print("⚠️  No game winner model trained yet. Skipping.")
+        return pd.DataFrame()
+
+    standings = get_standings_df()
+    strength = build_team_strength(standings)
+
+    rows = []
+    for _, game in today.iterrows():
+        prob = predict_game_winner(game["home_team"], game["away_team"], model, scaler)
+        winner = game["home_team"] if prob > 0.5 else game["away_team"]
+        confidence = max(prob, 1 - prob) * 100
+
+        rows.append({
+            "home_team": game["home_team"],
+            "away_team": game["away_team"],
+            "home_win_prob": round(prob * 100, 1),
+            "away_win_prob": round((1 - prob) * 100, 1),
+            "predicted_winner": winner,
+            "confidence": round(confidence, 1),
+            "home_pts": strength[strength["team"] == game["home_team"]]["point_pct"].values[0] if len(strength[strength["team"] == game["home_team"]]) else 0,
+            "away_pts": strength[strength["team"] == game["away_team"]]["point_pct"].values[0] if len(strength[strength["team"] == game["away_team"]]) else 0,
+        })
+
+    return pd.DataFrame(rows)
+
+
+def print_game_picks(game_df: pd.DataFrame):
+    """Pretty-print game winner predictions."""
+    if game_df.empty:
+        return
+
+    print(f"\n\n🏆 GAME WINNER PREDICTIONS")
+    print("=" * 70)
+
+    for _, g in game_df.iterrows():
+        winner = g["predicted_winner"]
+        is_home_fav = g["home_win_prob"] > 50
+        emoji = "🏠" if is_home_fav else "✈️"
+        conf = g["confidence"]
+        conf_bar = "🟢" if conf >= 60 else "🟡" if conf >= 55 else "⚪"
+
+        print(f"  {g['away_team']} ({g['away_pts']:.3f}) @ {g['home_team']} ({g['home_pts']:.3f})")
+        print(f"    → {conf_bar} {emoji} {winner} wins ({conf:.1f}% confidence)")
+        print(f"      Home: {g['home_win_prob']}% | Away: {g['away_win_prob']}%")
+        print()
+
+
 def run():
     """Main entry point for daily predictions."""
     pred_df = predict_tonight()
     if not pred_df.empty:
         print_top_picks(pred_df)
 
+    # Game winner predictions
+    game_df = predict_game_winners()
+    if not game_df.empty:
+        print_game_picks(game_df)
+
+    if not pred_df.empty:
+        # Save predictions to tracker ledger
+        from src.predictions.tracker import save_predictions
+        save_predictions(pred_df)
+
         # Generate shareable HTML report
         from src.predictions.report import generate_html_report
-        report_path = generate_html_report(pred_df)
+        report_path = generate_html_report(pred_df, game_df=game_df)
         print(f"\n🌐 Open in browser: file://{report_path}")
 
     return pred_df
