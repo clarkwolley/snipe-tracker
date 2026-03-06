@@ -15,7 +15,7 @@ Good features capture WHY a player might score tonight.
 
 import pandas as pd
 import numpy as np
-from src.config import ROLLING_WINDOW, MIN_GAMES_PLAYED
+from src.config import ROLLING_WINDOW, MIN_GAMES_PLAYED, STREAK_MIN_GAMES
 
 
 def parse_toi_to_minutes(toi_str: str) -> float:
@@ -158,6 +158,131 @@ def add_position_encoding(df: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
+def add_streak_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Detect hot streaks and cold slumps for each player.
+
+    New columns:
+    - goal_streak: Consecutive games with a goal (0 if none)
+    - point_streak: Consecutive games with a point (0 if none)
+    - drought: Consecutive games WITHOUT a goal (0 if scored last game)
+    - is_hot: Binary flag — on a goal streak of 2+ games
+
+    💡 KEY CONCEPT: Streaks capture momentum. A player who scored
+    in 4 straight games is "seeing the puck" — their confidence
+    and shot selection tend to be better. Sports are as much
+    psychology as they are physics.
+    """
+    result = df.copy()
+    result = result.sort_values(["player_id", "game_date"])
+
+    def _calc_streak(series: pd.Series) -> pd.Series:
+        """Count consecutive True values ending at each position."""
+        streaks = []
+        count = 0
+        for val in series:
+            if val:
+                count += 1
+            else:
+                count = 0
+            streaks.append(count)
+        return pd.Series(streaks, index=series.index)
+
+    def _calc_drought(series: pd.Series) -> pd.Series:
+        """Count consecutive False values (no goals) ending at each position."""
+        droughts = []
+        count = 0
+        for val in series:
+            if not val:
+                count += 1
+            else:
+                count = 0
+            droughts.append(count)
+        return pd.Series(droughts, index=series.index)
+
+    # Ensure 'scored' column exists
+    if "scored" not in result.columns:
+        result["scored"] = (result["goals"] > 0).astype(int)
+
+    scored_bool = result["scored"].astype(bool)
+    has_point = (result["points"] > 0) if "points" in result.columns else scored_bool
+
+    # Goal streak: shift by 1 so we see the streak ENTERING the game
+    result["goal_streak"] = (
+        result.groupby("player_id")["scored"]
+        .transform(lambda x: _calc_streak(x.astype(bool)).shift(1).fillna(0))
+        .astype(int)
+    )
+
+    result["point_streak"] = (
+        result.groupby("player_id")[has_point.name if hasattr(has_point, 'name') else "points"]
+        .transform(lambda x: _calc_streak((x > 0) if x.dtype != bool else x).shift(1).fillna(0))
+        .astype(int)
+    )
+
+    result["drought"] = (
+        result.groupby("player_id")["scored"]
+        .transform(lambda x: _calc_drought(x.astype(bool)).shift(1).fillna(0))
+        .astype(int)
+    )
+
+    result["is_hot"] = (result["goal_streak"] >= STREAK_MIN_GAMES).astype(int)
+
+    return result
+
+
+def add_shot_quality_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add shot volume and efficiency features.
+
+    New columns:
+    - shots_per_toi: Shots per minute of ice time (shot generation rate)
+    - shooting_pct_trend: Change in shooting % over rolling window
+    - high_volume_shooter: Binary flag — above-average shot volume
+
+    💡 CONCEPT: Raw shot counts are misleading — a 4th liner who
+    plays 8 minutes and gets 1 shot isn't comparable to a 1st liner
+    who plays 22 minutes and gets 4 shots. Normalizing by TOI gives
+    us the TRUE shot generation rate.
+
+    "High danger" in the NHL world means shots from the slot area.
+    We can't get exact location data from the free API, but shot RATE
+    is a decent proxy — players who generate lots of shots per minute
+    tend to be getting quality chances from dangerous areas.
+    """
+    result = df.copy()
+
+    # Ensure toi_minutes exists
+    if "toi_minutes" not in result.columns:
+        result["toi_minutes"] = result["toi"].apply(parse_toi_to_minutes)
+
+    # Shots per minute of ice time (shot generation rate)
+    result["shots_per_toi"] = np.where(
+        result["toi_minutes"] > 0,
+        result["shots"] / result["toi_minutes"],
+        0.0,
+    )
+
+    # Rolling shooting % trend: current rolling vs. season average
+    if "rolling_shooting_pct" in result.columns:
+        season_avg_pct = result.groupby("player_id")["rolling_shooting_pct"].transform("mean")
+        result["shooting_pct_trend"] = result["rolling_shooting_pct"] - season_avg_pct
+    else:
+        result["shooting_pct_trend"] = 0.0
+
+    # High volume shooter flag
+    result["high_volume_shooter"] = (
+        result.groupby("player_id")["shots"]
+        .transform(lambda x: x.shift(1).rolling(window=ROLLING_WINDOW, min_periods=1).mean())
+    )
+    league_avg_shots = result["high_volume_shooter"].median()
+    result["high_volume_shooter"] = (
+        result["high_volume_shooter"] > league_avg_shots
+    ).astype(int)
+
+    return result
+
+
 def build_player_features(game_log: pd.DataFrame) -> pd.DataFrame:
     """
     Full feature engineering pipeline for player-level prediction.
@@ -187,10 +312,16 @@ def build_player_features(game_log: pd.DataFrame) -> pd.DataFrame:
     # Step 3: Shooting features
     df = add_shooting_features(df)
 
-    # Step 4: Position encoding
+    # Step 4: Streak detection (hot hand / cold slumps)
+    df = add_streak_features(df)
+
+    # Step 5: Shot quality and volume features
+    df = add_shot_quality_features(df)
+
+    # Step 6: Position encoding
     df = add_position_encoding(df)
 
-    # Step 5: Home/away as numeric
+    # Step 7: Home/away as numeric
     df["is_home"] = df["is_home"].astype(int)
 
     return df
@@ -198,15 +329,30 @@ def build_player_features(game_log: pd.DataFrame) -> pd.DataFrame:
 
 # The columns our model will actually use as inputs
 FEATURE_COLUMNS = [
+    # Rolling averages (recent form)
     "rolling_goals_avg",
     "rolling_shots_avg",
     "rolling_points_avg",
     "rolling_toi_avg",
     "rolling_shooting_pct",
     "games_in_window",
+    # Streak features (momentum)
+    "goal_streak",
+    "point_streak",
+    "drought",
+    "is_hot",
+    # Shot quality features
+    "shots_per_toi",
+    "shooting_pct_trend",
+    "high_volume_shooter",
+    # Player attributes
     "is_forward",
     "is_center",
     "is_home",
+    # Goalie matchup features (injected at prediction time)
+    "opp_goalie_save_pct",
+    "opp_goalie_gaa",
+    "opp_goalie_quality",
 ]
 
 # What we're predicting

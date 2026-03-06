@@ -180,7 +180,8 @@ def load_game_model() -> tuple:
     model = joblib.load(model_path)
     meta = joblib.load(os.path.join(MODEL_DIR, "game_model_meta.pkl"))
     scaler_path = os.path.join(MODEL_DIR, "game_scaler.pkl")
-    scaler = joblib.load(scaler_path) if os.path.exists(scaler_path) else None
+    needs_scaling = meta.get("needs_scaling", False)
+    scaler = joblib.load(scaler_path) if needs_scaling and os.path.exists(scaler_path) else None
 
     return model, scaler, meta
 

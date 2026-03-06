@@ -63,6 +63,13 @@ def _build_game_winner_html(game_df: pd.DataFrame) -> str:
         venue_icon = "🏠" if is_home_fav else "✈️"
         bar_width = g["home_win_prob"]
 
+        home_pp = g.get('home_pp_pct', 0.20)
+        away_pp = g.get('away_pp_pct', 0.20)
+        pp_display = (
+            f"PP: {g['home_team']} {home_pp*100 if home_pp < 1 else home_pp:.1f}% | "
+            f"{g['away_team']} {away_pp*100 if away_pp < 1 else away_pp:.1f}%"
+        )
+
         rows_html += f"""        <div class="game-winner-card {conf_class}">
             <div class="gw-matchup">{g['away_team']} @ {g['home_team']}</div>
             <div class="gw-pick">{conf_icon} {venue_icon} <strong>{winner}</strong> ({conf}%)</div>
@@ -70,6 +77,7 @@ def _build_game_winner_html(game_df: pd.DataFrame) -> str:
                 <div class="gw-bar-home" style="width: {bar_width}%">{g['home_team']} {g['home_win_prob']}%</div>
                 <div class="gw-bar-away" style="width: {100 - bar_width}%">{g['away_team']} {g['away_win_prob']}%</div>
             </div>
+            <div class="gw-special-teams">{pp_display}</div>
         </div>
 """
 
@@ -103,12 +111,26 @@ def generate_html_report(pred_df: pd.DataFrame, top_n: int = 30, game_df: pd.Dat
     display["tier"] = display["goal_probability"].apply(_tier_label)
     display["tier_class"] = display["goal_probability"].apply(_tier_class)
 
+    # Streak indicator
+    def _streak_badge(row):
+        if row.get("is_hot", 0):
+            return f'<span class="streak-hot">🔥 {int(row.get("goal_streak", 0))}G</span>'
+        if row.get("drought", 0) >= 5:
+            return f'<span class="streak-cold">❄️ {int(row.get("drought", 0))}G</span>'
+        return ""
+
+    display["streak_badge"] = display.apply(_streak_badge, axis=1)
+    display["goalie_info"] = display.get("opp_goalie_name", pd.Series([""] * len(display)))
+    display["b2b_flag"] = display.apply(
+        lambda r: "⚠️ B2B" if r.get("is_back_to_back", 0) else "", axis=1
+    )
+
     # Build player rows
     player_rows = ""
     for i, (_, row) in enumerate(display.iterrows(), 1):
         player_rows += f"""        <tr class="{row['tier_class']}">
             <td class="rank">{i}</td>
-            <td class="player">{row['name']}</td>
+            <td class="player">{row['name']} {row['streak_badge']} {row['b2b_flag']}</td>
             <td>{row['team']}</td>
             <td>{row['position']}</td>
             <td>{row['matchup']}</td>
@@ -118,6 +140,7 @@ def generate_html_report(pred_df: pd.DataFrame, top_n: int = 30, game_df: pd.Dat
             <td>{row['rolling_shots_avg']:.1f}</td>
             <td>{int(row['season_goals'])}</td>
             <td class="tier-badge">{row['tier']}</td>
+            <td class="goalie-col">{row.get('goalie_info', '')}</td>
         </tr>
 """
 
@@ -283,6 +306,9 @@ def generate_html_report(pred_df: pd.DataFrame, top_n: int = 30, game_df: pd.Dat
         .team-col ol {{ padding-left: 1.2rem; }}
         .team-col li {{ margin-bottom: 0.3rem; font-size: 0.9rem; }}
         .pct {{ color: #22c55e; font-weight: 700; }}
+        .streak-hot {{ background: #7f1d1d; color: #fca5a5; padding: 2px 6px; border-radius: 4px; font-size: 0.8rem; font-weight: 600; }}
+        .streak-cold {{ background: #1e3a5f; color: #93c5fd; padding: 2px 6px; border-radius: 4px; font-size: 0.8rem; font-weight: 600; }}
+        .goalie-col {{ font-size: 0.85rem; color: #94a3b8; }}
         .gw-grid {{
             display: grid;
             grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
@@ -304,6 +330,7 @@ def generate_html_report(pred_df: pd.DataFrame, top_n: int = 30, game_df: pd.Dat
         .gw-bar-container {{ display: flex; border-radius: 6px; overflow: hidden; height: 24px; font-size: 0.75rem; }}
         .gw-bar-home {{ background: #3b82f6; color: #fff; display: flex; align-items: center; justify-content: center; font-weight: 600; }}
         .gw-bar-away {{ background: #64748b; color: #fff; display: flex; align-items: center; justify-content: center; font-weight: 600; }}
+        .gw-special-teams {{ font-size: 0.8rem; color: #94a3b8; margin-top: 0.5rem; text-align: center; }}
         footer {{
             text-align: center;
             margin-top: 3rem;
@@ -341,6 +368,7 @@ def generate_html_report(pred_df: pd.DataFrame, top_n: int = 30, game_df: pd.Dat
                     <th>Roll S/Gm</th>
                     <th>Season G</th>
                     <th>Tier</th>
+                    <th>vs Goalie</th>
                 </tr>
             </thead>
             <tbody>

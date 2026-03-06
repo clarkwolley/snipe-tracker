@@ -13,12 +13,17 @@ import numpy as np
 from tabulate import tabulate
 
 from src.data import nhl_api
-from src.data.collector import get_todays_games, get_team_skaters
+from src.data.collector import (
+    get_todays_games,
+    get_team_skaters,
+    get_back_to_back_status,
+)
 from src.data.history import load_game_data
 from src.features.player_features import (
     build_player_features,
     FEATURE_COLUMNS,
 )
+from src.features.goalie_features import build_goalie_matchup_features
 from src.models.goal_model import load_goal_model, predict_goal_probability
 
 
@@ -34,12 +39,15 @@ def _get_teams_playing_today() -> list[dict]:
         return []
 
     today = schedule[schedule["date"] == schedule["date"].min()]
+    game_date = today["date"].iloc[0] if not today.empty else ""
     teams = []
     for _, game in today.iterrows():
         teams.append({"team": game["home_team"], "is_home": True,
-                      "opponent": game["away_team"], "game_id": game["game_id"]})
+                      "opponent": game["away_team"], "game_id": game["game_id"],
+                      "game_date": game_date})
         teams.append({"team": game["away_team"], "is_home": False,
-                      "opponent": game["home_team"], "game_id": game["game_id"]})
+                      "opponent": game["home_team"], "game_id": game["game_id"],
+                      "game_date": game_date})
     return teams
 
 
@@ -49,14 +57,16 @@ def _build_prediction_features(teams: list[dict], game_log: pd.DataFrame) -> pd.
 
     Strategy:
     1. Get season stats for each team's roster (current ability)
-    2. Look up each player's recent game log (recent form)
-    3. Combine into the features our model expects
+    2. Look up each player's recent game log (recent form + streaks)
+    3. Inject goalie matchup features (opposing goalie quality)
+    4. Inject back-to-back / rest features
+    5. Combine into the features our model expects
 
     💡 CONCEPT: For predictions, we need the same features the model
     was trained on. The rolling averages come from the player's
     RECENT games — the last 10 games they played.
     """
-    # Get recent game log for rolling averages
+    # Get recent game log for rolling averages + streaks
     featured = build_player_features(game_log)
 
     # For each player, get their LATEST rolling features
@@ -68,12 +78,38 @@ def _build_prediction_features(teams: list[dict], game_log: pd.DataFrame) -> pd.
         .reset_index()
     )
 
+    # Pre-fetch goalie matchup data per opponent (avoid duplicate API calls)
+    opponents = set(t["opponent"] for t in teams)
+    goalie_cache = {}
+    for opp in opponents:
+        try:
+            goalie_cache[opp] = build_goalie_matchup_features(opp)
+        except Exception as e:
+            print(f"  ⚠️  Could not fetch goalie for {opp}: {e}")
+            goalie_cache[opp] = {
+                "opp_goalie_save_pct": 0.900, "opp_goalie_gaa": 3.00,
+                "opp_goalie_quality": 7.5, "opp_goalie_name": "Unknown",
+            }
+
+    # Pre-fetch back-to-back status per team
+    b2b_cache = {}
+    for t in teams:
+        team = t["team"]
+        game_date = t.get("game_date", "")
+        if team not in b2b_cache and game_date:
+            try:
+                b2b_cache[team] = get_back_to_back_status(team, game_date)
+            except Exception:
+                b2b_cache[team] = {"is_back_to_back": False, "days_rest": 2}
+
     all_predictions = []
 
     for team_info in teams:
         team = team_info["team"]
         is_home = team_info["is_home"]
         opponent = team_info["opponent"]
+        goalie_feats = goalie_cache.get(opponent, {})
+        rest_info = b2b_cache.get(team, {"is_back_to_back": False, "days_rest": 2})
 
         try:
             roster = get_team_skaters(team)
@@ -98,9 +134,19 @@ def _build_prediction_features(teams: list[dict], game_log: pd.DataFrame) -> pd.
                     "rolling_goals_avg": player["goals"] / gp,
                     "rolling_shots_avg": player["shots"] / gp,
                     "rolling_points_avg": player["points"] / gp,
-                    "rolling_toi_avg": 15.0,  # default estimate
+                    "rolling_toi_avg": 15.0,
                     "rolling_shooting_pct": player["shooting_pct"],
                     "games_in_window": min(gp, 10),
+                    # Streak features — no history, default to 0
+                    "goal_streak": 0,
+                    "point_streak": 0,
+                    "drought": 0,
+                    "is_hot": 0,
+                    # Shot quality — default estimates
+                    "shots_per_toi": player["shots"] / gp / 15.0,
+                    "shooting_pct_trend": 0.0,
+                    "high_volume_shooter": int(player["shots"] / gp > 3.0),
+                    # Player attributes
                     "is_forward": int(player["position"] in ["C", "L", "R"]),
                     "is_center": int(player["position"] == "C"),
                     "season_goals": player["goals"],
@@ -121,11 +167,31 @@ def _build_prediction_features(teams: list[dict], game_log: pd.DataFrame) -> pd.
                     "rolling_toi_avg": h.get("rolling_toi_avg", 15.0),
                     "rolling_shooting_pct": h.get("rolling_shooting_pct", 0),
                     "games_in_window": h.get("games_in_window", 1),
+                    # Streak features from game log
+                    "goal_streak": int(h.get("goal_streak", 0)),
+                    "point_streak": int(h.get("point_streak", 0)),
+                    "drought": int(h.get("drought", 0)),
+                    "is_hot": int(h.get("is_hot", 0)),
+                    # Shot quality from game log
+                    "shots_per_toi": h.get("shots_per_toi", 0.0),
+                    "shooting_pct_trend": h.get("shooting_pct_trend", 0.0),
+                    "high_volume_shooter": int(h.get("high_volume_shooter", 0)),
+                    # Player attributes
                     "is_forward": int(player["position"] in ["C", "L", "R"]),
                     "is_center": int(player["position"] == "C"),
                     "season_goals": player["goals"],
                     "season_gp": player["games_played"],
                 }
+
+            # Inject goalie matchup features
+            row["opp_goalie_save_pct"] = goalie_feats.get("opp_goalie_save_pct", 0.900)
+            row["opp_goalie_gaa"] = goalie_feats.get("opp_goalie_gaa", 3.00)
+            row["opp_goalie_quality"] = goalie_feats.get("opp_goalie_quality", 7.5)
+            row["opp_goalie_name"] = goalie_feats.get("opp_goalie_name", "Unknown")
+
+            # Inject rest features
+            row["is_back_to_back"] = int(rest_info.get("is_back_to_back", False))
+            row["days_rest"] = rest_info.get("days_rest", 2)
 
             all_predictions.append(row)
 
@@ -150,6 +216,17 @@ def predict_tonight() -> pd.DataFrame:
 
     team_abbrevs = sorted(set(t["team"] for t in teams))
     print(f"\n📅 Teams playing: {', '.join(team_abbrevs)}")
+
+    # Show back-to-back warnings
+    for t in teams:
+        game_date = t.get("game_date", "")
+        if game_date:
+            try:
+                b2b = get_back_to_back_status(t["team"], game_date)
+                if b2b["is_back_to_back"]:
+                    print(f"   ⚠️  {t['team']} is on a BACK-TO-BACK (fatigue factor!)")
+            except Exception:
+                pass
 
     # 2. Load model
     print("🤖 Loading model...")
@@ -191,17 +268,25 @@ def print_top_picks(pred_df: pd.DataFrame, top_n: int = 25):
     display["matchup"] = display.apply(
         lambda r: f"{'vs' if r['is_home'] else '@'} {r['opponent']}", axis=1
     )
+    # Streak indicator: 🔥 for hot, ❄️ for drought 5+, blank otherwise
+    display["streak"] = display.apply(
+        lambda r: f"🔥{int(r.get('goal_streak', 0))}" if r.get("is_hot", 0)
+        else (f"❄️{int(r.get('drought', 0))}" if r.get("drought", 0) >= 5 else ""),
+        axis=1,
+    )
+    # Goalie info
+    display["vs_goalie"] = display.get("opp_goalie_name", "")
 
-    cols = ["name", "team", "position", "matchup", "prob_%", "gpg",
-            "rolling_goals_avg", "rolling_shots_avg", "season_goals"]
-    headers = ["Player", "Team", "Pos", "Matchup", "Goal%", "GPG",
-               "Roll G/Gm", "Roll S/Gm", "Season G"]
+    cols = ["name", "team", "position", "matchup", "prob_%", "streak",
+            "gpg", "rolling_shots_avg", "season_goals", "vs_goalie"]
+    headers = ["Player", "Team", "Pos", "Matchup", "Goal%", "Streak",
+               "GPG", "Roll S/Gm", "Season G", "vs Goalie"]
 
     print(tabulate(
         display[cols].values,
         headers=headers,
         tablefmt="simple",
-        floatfmt=(".0f", ".0f", ".0f", ".0f", ".1f", ".2f", ".2f", ".1f", ".0f"),
+        floatfmt=(".0f", ".0f", ".0f", ".0f", ".1f", ".0f", ".2f", ".1f", ".0f", ".0f"),
     ))
 
     # Per-game breakdown
@@ -250,6 +335,9 @@ def predict_game_winners() -> pd.DataFrame:
         winner = game["home_team"] if prob > 0.5 else game["away_team"]
         confidence = max(prob, 1 - prob) * 100
 
+        home_strength = strength[strength["team"] == game["home_team"]]
+        away_strength = strength[strength["team"] == game["away_team"]]
+
         rows.append({
             "home_team": game["home_team"],
             "away_team": game["away_team"],
@@ -257,8 +345,10 @@ def predict_game_winners() -> pd.DataFrame:
             "away_win_prob": round((1 - prob) * 100, 1),
             "predicted_winner": winner,
             "confidence": round(confidence, 1),
-            "home_pts": strength[strength["team"] == game["home_team"]]["point_pct"].values[0] if len(strength[strength["team"] == game["home_team"]]) else 0,
-            "away_pts": strength[strength["team"] == game["away_team"]]["point_pct"].values[0] if len(strength[strength["team"] == game["away_team"]]) else 0,
+            "home_pts": home_strength["point_pct"].values[0] if len(home_strength) else 0,
+            "away_pts": away_strength["point_pct"].values[0] if len(away_strength) else 0,
+            "home_pp_pct": home_strength["pp_pct"].values[0] if len(home_strength) else 0.20,
+            "away_pp_pct": away_strength["pp_pct"].values[0] if len(away_strength) else 0.20,
         })
 
     return pd.DataFrame(rows)

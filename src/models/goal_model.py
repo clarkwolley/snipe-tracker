@@ -41,6 +41,67 @@ def _ensure_model_dir():
     os.makedirs(MODEL_DIR, exist_ok=True)
 
 
+def _inject_training_goalie_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add goalie matchup features to training data.
+
+    For each player-game row, figure out the opponent team and look up
+    their current goalie stats. Uses current stats as a proxy for
+    historical — not perfect, but gives the model signal to learn from.
+
+    💡 CONCEPT: We cache goalie lookups per team to avoid redundant
+    API calls. 32 teams = 32 calls max, regardless of dataset size.
+    """
+    from src.features.goalie_features import build_goalie_matchup_features
+
+    result = df.copy()
+
+    # Derive opponent: for each game_id, the "other team" is the opponent
+    if "team" in result.columns and "game_id" in result.columns:
+        game_teams = (
+            result.groupby("game_id")["team"]
+            .apply(lambda x: set(x.unique()))
+            .to_dict()
+        )
+        result["_opponent"] = result.apply(
+            lambda r: next(
+                (t for t in game_teams.get(r["game_id"], set()) if t != r["team"]),
+                None,
+            ),
+            axis=1,
+        )
+    else:
+        result["_opponent"] = None
+
+    # Cache goalie features per opponent team
+    unique_opponents = result["_opponent"].dropna().unique()
+    goalie_cache = {}
+    print(f"   🧊 Fetching goalie stats for {len(unique_opponents)} opponent teams...")
+    for opp in unique_opponents:
+        try:
+            goalie_cache[opp] = build_goalie_matchup_features(opp)
+        except Exception:
+            goalie_cache[opp] = {
+                "opp_goalie_save_pct": 0.900,
+                "opp_goalie_gaa": 3.00,
+                "opp_goalie_quality": 7.5,
+            }
+
+    # Inject features
+    result["opp_goalie_save_pct"] = result["_opponent"].map(
+        lambda o: goalie_cache.get(o, {}).get("opp_goalie_save_pct", 0.900)
+    )
+    result["opp_goalie_gaa"] = result["_opponent"].map(
+        lambda o: goalie_cache.get(o, {}).get("opp_goalie_gaa", 3.00)
+    )
+    result["opp_goalie_quality"] = result["_opponent"].map(
+        lambda o: goalie_cache.get(o, {}).get("opp_goalie_quality", 7.5)
+    )
+
+    result = result.drop(columns=["_opponent"], errors="ignore")
+    return result
+
+
 def prepare_training_data(game_log: pd.DataFrame) -> tuple:
     """
     Prepare features and target from raw game log.
@@ -63,8 +124,21 @@ def prepare_training_data(game_log: pd.DataFrame) -> tuple:
     """
     df = build_player_features(game_log)
 
-    # Drop rows with missing features
-    df = df.dropna(subset=FEATURE_COLUMNS)
+    # Inject goalie matchup features for training data.
+    # We derive the opponent from game_id groupings and use current
+    # goalie stats as a proxy. Not perfect for historical games, but
+    # directionally correct — the model learns that high save% goalies
+    # suppress scoring.
+    df = _inject_training_goalie_features(df)
+
+    # Drop rows with missing features (first appearances, etc.)
+    available_features = [c for c in FEATURE_COLUMNS if c in df.columns]
+    df = df.dropna(subset=available_features)
+
+    # Fill any remaining missing feature columns with 0
+    for col in FEATURE_COLUMNS:
+        if col not in df.columns:
+            df[col] = 0.0
 
     X = df[FEATURE_COLUMNS].copy()
     y = df[TARGET_COLUMN].copy()
@@ -216,7 +290,12 @@ def load_goal_model() -> tuple:
 
     model = joblib.load(model_path)
     meta = joblib.load(meta_path)
-    scaler = joblib.load(scaler_path) if os.path.exists(scaler_path) else None
+
+    # Only load scaler if the saved model actually needs it.
+    # A stale scaler file from a previous LR run can linger
+    # when GB wins — trust the meta flag, not the file.
+    needs_scaling = meta.get("needs_scaling", False)
+    scaler = joblib.load(scaler_path) if needs_scaling and os.path.exists(scaler_path) else None
 
     return model, scaler, meta
 

@@ -25,6 +25,8 @@ def build_team_strength(standings_df: pd.DataFrame) -> pd.DataFrame:
     - goal_diff_pg: Goal differential per game
     - home_win_pct: Win % at home
     - road_win_pct: Win % on the road
+    - pp_pct: Power play percentage (if available from standings)
+    - pk_pct: Penalty kill percentage (if available from standings)
 
     💡 CONCEPT: Per-game rates let us compare teams fairly even if
     they've played different numbers of games. A team scoring 3.5
@@ -43,6 +45,12 @@ def build_team_strength(standings_df: pd.DataFrame) -> pd.DataFrame:
 
     df["home_win_pct"] = df["home_wins"] / home_games
     df["road_win_pct"] = df["road_wins"] / road_games
+
+    # Special teams — use standings data if present, else league avg
+    if "pp_pct" not in df.columns:
+        df["pp_pct"] = 0.20  # ~20% league average
+    if "pk_pct" not in df.columns:
+        df["pk_pct"] = 0.80  # ~80% league average
 
     return df
 
@@ -99,6 +107,60 @@ def build_matchup_features(
         "goal_diff_pg_diff": home["goal_diff_pg"] - away["goal_diff_pg"],
         "offense_vs_defense": home["goals_for_pg"] - away["goals_against_pg"],
         "defense_vs_offense": away["goals_for_pg"] - home["goals_against_pg"],
+        # Special teams
+        "home_pp_pct": home.get("pp_pct", 0.20),
+        "home_pk_pct": home.get("pk_pct", 0.80),
+        "away_pp_pct": away.get("pp_pct", 0.20),
+        "away_pk_pct": away.get("pk_pct", 0.80),
+        # PP vs PK matchup: home PP attacking away PK and vice versa
+        "home_pp_vs_away_pk": home.get("pp_pct", 0.20) - (1 - away.get("pk_pct", 0.80)),
+        "away_pp_vs_home_pk": away.get("pp_pct", 0.20) - (1 - home.get("pk_pct", 0.80)),
+    }
+
+
+def build_rest_features(
+    home_team: str,
+    away_team: str,
+    game_date: str,
+) -> dict:
+    """
+    Build fatigue/rest features for a matchup.
+
+    Args:
+        home_team: Home team abbreviation
+        away_team: Away team abbreviation
+        game_date: Game date 'YYYY-MM-DD'
+
+    Returns:
+        Dict with rest features:
+        - home_b2b: 1 if home team on back-to-back, 0 otherwise
+        - away_b2b: 1 if away team on back-to-back, 0 otherwise
+        - home_days_rest: Days since home team's last game
+        - away_days_rest: Days since away team's last game
+        - rest_advantage: Positive = home team more rested
+
+    💡 CONCEPT: Fatigue is real. Teams on a back-to-back lose
+    ~4-5% more often than rested teams. The effect is even
+    larger for the away team on a B2B (travel fatigue stacks).
+    """
+    from src.data.collector import get_back_to_back_status
+
+    try:
+        home_rest = get_back_to_back_status(home_team, game_date)
+        away_rest = get_back_to_back_status(away_team, game_date)
+    except Exception:
+        return {
+            "home_b2b": 0, "away_b2b": 0,
+            "home_days_rest": 2, "away_days_rest": 2,
+            "rest_advantage": 0,
+        }
+
+    return {
+        "home_b2b": int(home_rest["is_back_to_back"]),
+        "away_b2b": int(away_rest["is_back_to_back"]),
+        "home_days_rest": home_rest["days_rest"],
+        "away_days_rest": away_rest["days_rest"],
+        "rest_advantage": away_rest["days_rest"] - home_rest["days_rest"],
     }
 
 
@@ -147,4 +209,11 @@ GAME_FEATURE_COLUMNS = [
     "goal_diff_pg_diff",
     "offense_vs_defense",
     "defense_vs_offense",
+    # Special teams
+    "home_pp_pct",
+    "home_pk_pct",
+    "away_pp_pct",
+    "away_pk_pct",
+    "home_pp_vs_away_pk",
+    "away_pp_vs_home_pk",
 ]

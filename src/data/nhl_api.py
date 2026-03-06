@@ -21,9 +21,13 @@ class NHLApiError(Exception):
     """Raised when an NHL API request fails."""
 
 
+MAX_RETRIES = 3
+RETRY_BACKOFF = [5, 15, 30]  # seconds to wait between retries
+
+
 def _get(endpoint: str) -> dict:
     """
-    Make a GET request to the NHL API.
+    Make a GET request to the NHL API with automatic retry on 429.
 
     Args:
         endpoint: API path (e.g., '/schedule/now')
@@ -32,15 +36,26 @@ def _get(endpoint: str) -> dict:
         Parsed JSON response as a dict.
 
     Raises:
-        NHLApiError: If the request fails or returns non-200.
+        NHLApiError: If the request fails after all retries.
     """
+    import time
+
     url = f"{NHL_API_BASE}{endpoint}"
-    try:
-        response = requests.get(url, timeout=DEFAULT_TIMEOUT)
-        response.raise_for_status()
-        return response.json()
-    except requests.RequestException as e:
-        raise NHLApiError(f"NHL API request failed: {url} — {e}") from e
+
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            response = requests.get(url, timeout=DEFAULT_TIMEOUT)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.HTTPError as e:
+            if response.status_code == 429 and attempt < MAX_RETRIES:
+                wait = RETRY_BACKOFF[attempt]
+                print(f"  ⏳ Rate limited, retrying in {wait}s... (attempt {attempt + 1}/{MAX_RETRIES})")
+                time.sleep(wait)
+                continue
+            raise NHLApiError(f"NHL API request failed: {url} — {e}") from e
+        except requests.RequestException as e:
+            raise NHLApiError(f"NHL API request failed: {url} — {e}") from e
 
 
 def get_schedule(date: str = "now") -> dict:
@@ -126,3 +141,19 @@ def get_team_schedule(team_abbrev: str, season: str = "20242025") -> dict:
         and scores (for completed games).
     """
     return _get(f"/club-schedule-season/{team_abbrev}/{season}")
+
+
+def get_player_game_log(player_id: int, season: str = "20242025") -> dict:
+    """
+    Fetch a player's game-by-game log for a season.
+
+    Works for both skaters and goalies.
+
+    Args:
+        player_id: NHL player ID
+        season: Season string like '20242025'
+
+    Returns:
+        Dict with 'gameLog' list of per-game stat lines.
+    """
+    return _get(f"/player/{player_id}/game-log/{season}/2")

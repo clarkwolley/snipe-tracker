@@ -36,11 +36,20 @@ def save_predictions(pred_df: pd.DataFrame):
     💡 CONCEPT: The ledger is your "paper trail." You can always
     go back and see what the model predicted on any given date.
     """
-    picks = pred_df[[
+    # Columns to persist — include new features for historical analysis
+    save_cols = [
         "player_id", "name", "team", "opponent", "position",
         "is_home", "goal_probability", "rolling_goals_avg",
         "rolling_shots_avg", "season_goals", "season_gp",
-    ]].copy()
+        # New features
+        "goal_streak", "point_streak", "drought", "is_hot",
+        "shots_per_toi", "high_volume_shooter",
+        "opp_goalie_save_pct", "opp_goalie_gaa", "opp_goalie_name",
+        "is_back_to_back", "days_rest",
+    ]
+    # Only save columns that actually exist (backward compat)
+    available_cols = [c for c in save_cols if c in pred_df.columns]
+    picks = pred_df[available_cols].copy()
     picks["prediction_date"] = datetime.now().strftime("%Y-%m-%d")
     picks["predicted_at"] = datetime.now().isoformat()
 
