@@ -139,3 +139,44 @@ def load_game_data(filename: str = "game_log.csv") -> pd.DataFrame:
             f"No data file at {path}. Run collect_date_range() first!"
         )
     return pd.read_csv(path)
+
+
+def refresh_game_log(filename: str = "game_log.csv") -> pd.DataFrame:
+    """
+    Bring the game log up to date by fetching games since the last entry.
+
+    Looks at the latest game_date in the CSV, then collects boxscores
+    for every completed game from that date through yesterday. Appends
+    new rows and saves.
+
+    Returns:
+        The updated full game log DataFrame.
+    """
+    path = os.path.join(DATA_DIR, filename)
+    existing = load_game_data(filename)
+    last_date = existing["game_date"].max()
+
+    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    if last_date >= yesterday:
+        print(f"📅 Game log already current (through {last_date})")
+        return existing
+
+    # Fetch from the day after the last entry through yesterday
+    start = (datetime.strptime(last_date, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+    print(f"📅 Refreshing game log: {start} → {yesterday}")
+
+    new_data = collect_date_range(start, yesterday, delay=0.4)
+
+    if new_data.empty:
+        print("   No new games found.")
+        return existing
+
+    # De-duplicate on (game_id, player_id) in case of overlap
+    combined = pd.concat([existing, new_data], ignore_index=True)
+    combined = combined.drop_duplicates(subset=["game_id", "player_id"], keep="last")
+    combined = combined.sort_values("game_date").reset_index(drop=True)
+
+    save_game_data(combined, filename)
+    print(f"   ✅ Added {len(combined) - len(existing)} new rows ({len(combined)} total)")
+    return combined

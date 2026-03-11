@@ -33,6 +33,12 @@ models/*.joblib
 # Generated reports
 reports/
 
+# Logs
+logs/
+
+# launchd plist (contains local paths)
+com.snipetracker.*.plist
+
 # OS
 .DS_Store
 Thumbs.db

@@ -1,0 +1,19 @@
+[project]
+name = "snipe-tracker"
+version = "0.1.0"
+description = "NHL goal scorer & game winner predictions"
+requires-python = ">=3.12"
+dependencies = [
+    "pandas>=2.0",
+    "numpy>=1.24",
+    "requests>=2.31",
+    "scikit-learn>=1.3",
+    "matplotlib>=3.7",
+    "seaborn>=0.12",
+    "python-dateutil>=2.8",
+    "tabulate>=0.9",
+]
+
+[project.scripts]
+snipe-train = "src.train:main"
+snipe-predict = "src.predictions.daily:run"

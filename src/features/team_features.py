@@ -46,11 +46,13 @@ def build_team_strength(standings_df: pd.DataFrame) -> pd.DataFrame:
     df["home_win_pct"] = df["home_wins"] / home_games
     df["road_win_pct"] = df["road_wins"] / road_games
 
-    # Special teams — use standings data if present, else league avg
+    # Special teams — real PP/PK now come from get_standings_df(),
+    # which merges data from the NHL stats API.  This fallback only
+    # fires if that merge failed or a new column layout appears.
     if "pp_pct" not in df.columns:
-        df["pp_pct"] = 0.20  # ~20% league average
+        df["pp_pct"] = 0.20  # ~20% league average (safety net)
     if "pk_pct" not in df.columns:
-        df["pk_pct"] = 0.80  # ~80% league average
+        df["pk_pct"] = 0.80  # ~80% league average (safety net)
 
     return df
 

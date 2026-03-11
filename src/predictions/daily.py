@@ -18,18 +18,20 @@ from src.data.collector import (
     get_team_skaters,
     get_back_to_back_status,
 )
-from src.data.history import load_game_data
+from src.data.history import load_game_data, refresh_game_log
 from src.features.player_features import (
     build_player_features,
     FEATURE_COLUMNS,
 )
 from src.features.goalie_features import build_goalie_matchup_features
 from src.models.goal_model import load_goal_model, predict_goal_probability
+from src.data.injuries import get_unavailable_players, print_injury_report
+from src.config import PDO_SELL_HIGH_THRESHOLD, SELL_HIGH_SCORING_PACE
 
 
 def _get_teams_playing_today() -> list[dict]:
     """
-    Get all teams playing in today's earliest scheduled games.
+    Get all teams playing in today's scheduled games.
 
     Returns:
         List of dicts with team abbreviation and home/away status.
@@ -38,10 +40,9 @@ def _get_teams_playing_today() -> list[dict]:
     if schedule.empty:
         return []
 
-    today = schedule[schedule["date"] == schedule["date"].min()]
-    game_date = today["date"].iloc[0] if not today.empty else ""
+    game_date = schedule["date"].iloc[0]
     teams = []
-    for _, game in today.iterrows():
+    for _, game in schedule.iterrows():
         teams.append({"team": game["home_team"], "is_home": True,
                       "opponent": game["away_team"], "game_id": game["game_id"],
                       "game_date": game_date})
@@ -102,6 +103,20 @@ def _build_prediction_features(teams: list[dict], game_log: pd.DataFrame) -> pd.
             except Exception:
                 b2b_cache[team] = {"is_back_to_back": False, "days_rest": 2}
 
+    # Pre-fetch own-team goalie save % for PDO calculation.
+    # PDO = player SH% + team SV%.  High PDO (>103) signals luck
+    # that will regress, making the player a sell-high candidate.
+    from src.features.goalie_features import get_likely_starter
+    team_sv_cache = {}
+    for t in teams:
+        team = t["team"]
+        if team not in team_sv_cache:
+            try:
+                starter = get_likely_starter(team)
+                team_sv_cache[team] = starter["goalie_save_pct"]
+            except Exception:
+                team_sv_cache[team] = 0.900
+
     all_predictions = []
 
     for team_info in teams:
@@ -115,6 +130,7 @@ def _build_prediction_features(teams: list[dict], game_log: pd.DataFrame) -> pd.
             roster = get_team_skaters(team)
         except Exception as e:
             print(f"  ⚠️  Could not fetch roster for {team}: {e}")
+            print(f"       → ALL players on {team} excluded from predictions!")
             continue
 
         for _, player in roster.iterrows():
@@ -146,6 +162,8 @@ def _build_prediction_features(teams: list[dict], game_log: pd.DataFrame) -> pd.
                     "shots_per_toi": player["shots"] / gp / 15.0,
                     "shooting_pct_trend": 0.0,
                     "high_volume_shooter": int(player["shots"] / gp > 3.0),
+                    # PP production
+                    "rolling_pp_goals_avg": player.get("pp_goals", 0) / gp,
                     # Player attributes
                     "is_forward": int(player["position"] in ["C", "L", "R"]),
                     "is_center": int(player["position"] == "C"),
@@ -176,6 +194,8 @@ def _build_prediction_features(teams: list[dict], game_log: pd.DataFrame) -> pd.
                     "shots_per_toi": h.get("shots_per_toi", 0.0),
                     "shooting_pct_trend": h.get("shooting_pct_trend", 0.0),
                     "high_volume_shooter": int(h.get("high_volume_shooter", 0)),
+                    # PP production
+                    "rolling_pp_goals_avg": h.get("rolling_pp_goals_avg", 0),
                     # Player attributes
                     "is_forward": int(player["position"] in ["C", "L", "R"]),
                     "is_center": int(player["position"] == "C"),
@@ -193,9 +213,50 @@ def _build_prediction_features(teams: list[dict], game_log: pd.DataFrame) -> pd.
             row["is_back_to_back"] = int(rest_info.get("is_back_to_back", False))
             row["days_rest"] = rest_info.get("days_rest", 2)
 
+            # Own-team goalie SV% for PDO calculation
+            row["team_sv_pct"] = team_sv_cache.get(team, 0.900)
+
             all_predictions.append(row)
 
     return pd.DataFrame(all_predictions)
+
+
+def _log_leader_coverage(pred_df: pd.DataFrame, teams: list[dict]) -> None:
+    """
+    Log where the league's top goal scorers rank in tonight's predictions.
+
+    This makes it immediately obvious whether a league leader:
+    - Isn't playing tonight (team not scheduled)
+    - Was excluded by injury filtering
+    - Is playing but ranked lower than expected
+
+    Helps debug "why isn't Player X in the top picks?" questions.
+    """
+    playing_teams = {t["team"] for t in teams}
+
+    # Rank by season goals to approximate "league leaders"
+    if pred_df.empty or "season_goals" not in pred_df.columns:
+        return
+
+    top_scorers = pred_df.nlargest(10, "season_goals")
+    print("\n📊 LEAGUE LEADER CHECK (top scorers playing tonight):")
+
+    for i, (_, row) in enumerate(top_scorers.iterrows(), 1):
+        rank_in_preds = pred_df.index.get_loc(row.name) + 1
+        prob_pct = row["goal_probability"] * 100
+        note = ""
+        if row.get("sell_high", 0):
+            note += " [📉 SELL HIGH]"
+        if row.get("is_back_to_back", 0):
+            note += " [B2B]"
+        if row.get("injury_note", "") == "DTD":
+            note += " [DTD]"
+
+        print(
+            f"   {i:2d}. {row['name']:25s} ({row['team']}) "
+            f"— {int(row['season_goals'])}G this season → "
+            f"ranked #{rank_in_preds} tonight ({prob_pct:.1f}%){note}"
+        )
 
 
 def predict_tonight() -> pd.DataFrame:
@@ -215,7 +276,8 @@ def predict_tonight() -> pd.DataFrame:
         return pd.DataFrame()
 
     team_abbrevs = sorted(set(t["team"] for t in teams))
-    print(f"\n📅 Teams playing: {', '.join(team_abbrevs)}")
+    print(f"\n📅 Teams playing ({len(team_abbrevs)} teams): {', '.join(team_abbrevs)}")
+    print(f"   ℹ️  Only players on tonight's teams can appear in predictions.")
 
     # Show back-to-back warnings
     for t in teams:
@@ -228,25 +290,70 @@ def predict_tonight() -> pd.DataFrame:
             except Exception:
                 pass
 
+    # 1b. Fetch injury report
+    print("\n🏥 Checking injury report...")
+    injury_df = print_injury_report(teams=team_abbrevs)
+    unavailable = get_unavailable_players(teams=team_abbrevs)
+    if unavailable:
+        print(f"\n   → {len(unavailable)} players will be excluded from predictions")
+
     # 2. Load model
     print("🤖 Loading model...")
     model, scaler, meta = load_goal_model()
     print(f"   Model type: {meta['model_type']}")
     print(f"   Training AUC: {meta['metrics']['roc_auc']:.3f}")
 
-    # 3. Build features
-    print("⚙️  Building features...")
-    game_log = load_game_data()
+    # 3. Build features (refresh game log first — stale data = bad streaks)
+    print("⚙️  Refreshing game log...")
+    game_log = refresh_game_log()
     pred_df = _build_prediction_features(teams, game_log)
     print(f"   {len(pred_df)} players across {len(team_abbrevs)} teams")
 
-    # 4. Fill any NaN features with 0 (new players without history)
+    # 4. Filter out injured players (Out / IR / Suspended)
+    if unavailable:
+        before = len(pred_df)
+        pred_df = pred_df[~pred_df["name"].isin(unavailable)].reset_index(drop=True)
+        excluded = before - len(pred_df)
+        if excluded:
+            print(f"   🚫 Excluded {excluded} injured/suspended players")
+
+    # Annotate Day-to-Day players so they show in output
+    if not injury_df.empty:
+        dtd_players = set(
+            injury_df[injury_df["status"] == "Day-To-Day"]["player_name"]
+        )
+        pred_df["injury_note"] = pred_df["name"].apply(
+            lambda n: "DTD" if n in dtd_players else ""
+        )
+    else:
+        pred_df["injury_note"] = ""
+
+    # 5. Fill any NaN features with 0 (new players without history)
     pred_df[FEATURE_COLUMNS] = pred_df[FEATURE_COLUMNS].fillna(0)
 
-    # 5. Predict
+    # 6. Predict
     print("🎯 Running predictions...\n")
-    pred_df["goal_probability"] = predict_goal_probability(model, scaler, pred_df)
+    pred_df["goal_probability"] = predict_goal_probability(
+        model, scaler, pred_df, meta=meta
+    )
     pred_df = pred_df.sort_values("goal_probability", ascending=False)
+
+    # 7. PDO regression detection
+    # PDO = (personal SH% * 100) + (team SV% * 100)
+    # League-average PDO ~ 100.  Values above 103 are unsustainable
+    # and predict regression — a "sell high" signal.
+    pred_df["pdo"] = (
+        pred_df["rolling_shooting_pct"] * 100
+        + pred_df.get("team_sv_pct", pd.Series([90.0] * len(pred_df))).fillna(90.0) * 100
+    )
+    pred_df["sell_high"] = (
+        (pred_df["rolling_goals_avg"] >= SELL_HIGH_SCORING_PACE)
+        & (pred_df["pdo"] > PDO_SELL_HIGH_THRESHOLD)
+    ).astype(int)
+
+    # Sanity check: surface league leaders so we can tell at a glance
+    # whether top scorers are playing tonight and where they rank.
+    _log_leader_coverage(pred_df, teams)
 
     return pred_df
 
@@ -274,6 +381,20 @@ def print_top_picks(pred_df: pd.DataFrame, top_n: int = 25):
         else (f"❄️{int(r.get('drought', 0))}" if r.get("drought", 0) >= 5 else ""),
         axis=1,
     )
+    # Sell-high indicator: 📉 for PDO regression candidates
+    if "sell_high" in display.columns:
+        display["streak"] = display.apply(
+            lambda r: f"📉SH {r['streak']}" if r.get("sell_high", 0)
+            else r["streak"],
+            axis=1,
+        )
+    # Injury annotation: ⚠️ DTD for day-to-day players
+    if "injury_note" in display.columns:
+        display["streak"] = display.apply(
+            lambda r: f"⚠️DTD {r['streak']}" if r.get("injury_note") == "DTD"
+            else r["streak"],
+            axis=1,
+        )
     # Goalie info
     display["vs_goalie"] = display.get("opp_goalie_name", "")
 
@@ -318,8 +439,6 @@ def predict_game_winners() -> pd.DataFrame:
     if schedule.empty:
         return pd.DataFrame()
 
-    today = schedule[schedule["date"] == schedule["date"].min()]
-
     try:
         model, scaler, meta = load_game_model()
     except FileNotFoundError:
@@ -330,7 +449,7 @@ def predict_game_winners() -> pd.DataFrame:
     strength = build_team_strength(standings)
 
     rows = []
-    for _, game in today.iterrows():
+    for _, game in schedule.iterrows():
         prob = predict_game_winner(game["home_team"], game["away_team"], model, scaler)
         winner = game["home_team"] if prob > 0.5 else game["away_team"]
         confidence = max(prob, 1 - prob) * 100

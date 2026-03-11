@@ -97,7 +97,8 @@ def discover_season_games(season: str) -> pd.DataFrame:
                 }
 
             print(f"   [{i:2d}/{len(teams)}] {team}: {len(games)} games in schedule")
-            time.sleep(0.2)
+            # _get() already throttles via MIN_REQUEST_GAP, but add courtesy gap
+            time.sleep(0.3)
 
         except nhl_api.NHLApiError as e:
             print(f"   [{i:2d}/{len(teams)}] ⚠️  {team}: {e}")

@@ -15,7 +15,7 @@ Good features capture WHY a player might score tonight.
 
 import pandas as pd
 import numpy as np
-from src.config import ROLLING_WINDOW, MIN_GAMES_PLAYED, STREAK_MIN_GAMES
+from src.config import ROLLING_WINDOW, RECENCY_WINDOW, RECENCY_WEIGHT, STREAK_MIN_GAMES
 
 
 def parse_toi_to_minutes(toi_str: str) -> float:
@@ -58,80 +58,121 @@ def add_basic_rates(df: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
-def add_rolling_averages(df: pd.DataFrame, window: int = ROLLING_WINDOW) -> pd.DataFrame:
+
+def add_rolling_averages(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Calculate rolling averages for each player over their last N games.
+    Calculate rolling averages with recency weighting.
+
+    Uses a 50-game window with two weighting strategies:
+
+    **Volume metrics** (shots, goals, points, TOI, PP goals):
+      The most recent 10 games are weighted 1.5x.  Volume reflects
+      opportunity and deployment — if a coach just moved a player to
+      the top line last week, the recent 10 games matter more than
+      the 40 before that.
+
+    **Efficiency metrics** (shooting %):
+      Equal weight across the full 50 games.  Larger samples give a
+      truer read on a player's conversion rate; small-sample SH%
+      is notoriously noisy.
 
     New columns:
-    - rolling_goals_avg: Average goals over last N games
-    - rolling_shots_avg: Average shots over last N games
-    - rolling_points_avg: Average points over last N games
-    - rolling_toi_avg: Average TOI over last N games
-    - games_in_window: How many of the last N games we have data for
-
-    💡 KEY CONCEPT: Rolling averages capture "recent form." A player
-    on a hot streak (3 goals in last 5 games) is more likely to score
-    than their season average suggests. This is one of the most
-    powerful features in sports prediction.
-
-    The "window" is how many games to look back. Too small (2-3) and
-    it's noisy. Too large (20+) and it's just the season average.
-    We default to 10 as a good balance.
+    - rolling_goals_avg, rolling_shots_avg, rolling_points_avg,
+      rolling_toi_avg, rolling_pp_goals_avg  (recency-weighted volume)
+    - rolling_shooting_pct  (50-game equal-weight efficiency)
+    - games_in_window
     """
     result = df.copy()
     result = result.sort_values(["player_id", "game_date"])
 
-    rolling_cols = {
-        "goals": "rolling_goals_avg",
-        "shots": "rolling_shots_avg",
-        "points": "rolling_points_avg",
-        "toi_minutes": "rolling_toi_avg",
-    }
-
-    # Need toi_minutes first
     if "toi_minutes" not in result.columns:
         result["toi_minutes"] = result["toi"].apply(parse_toi_to_minutes)
+    if "pp_goals" not in result.columns:
+        result["pp_goals"] = 0
 
-    for raw_col, new_col in rolling_cols.items():
-        result[new_col] = (
+    # --- helper: shifted rolling aggregation per player ----------------
+    def _rolling(col: str, window: int, agg: str = "mean") -> pd.Series:
+        return (
             result
-            .groupby("player_id")[raw_col]
-            .transform(lambda x: x.shift(1).rolling(window=window, min_periods=1).mean())
+            .groupby("player_id")[col]
+            .transform(
+                lambda x: getattr(
+                    x.shift(1).rolling(window, min_periods=1), agg
+                )()
+            )
         )
 
-    # Track how many games in the rolling window (more data = more reliable)
-    result["games_in_window"] = (
-        result
-        .groupby("player_id")["goals"]
-        .transform(lambda x: x.shift(1).rolling(window=window, min_periods=1).count())
+    # Games in full window (shared denominator)
+    count_full = _rolling("goals", ROLLING_WINDOW, "count")
+
+    # --- Volume metrics: recency-weighted ------------------------------
+    #
+    # Formula:
+    #   n_recent  = min(games_in_window, RECENCY_WINDOW)
+    #   boost     = RECENCY_WEIGHT - 1.0          (0.5 with defaults)
+    #   weight    = count_full + n_recent * boost  (total weight)
+    #   weighted  = (roll_full * count_full
+    #                + roll_recent * n_recent * boost) / weight
+    #
+    # When a player has <= RECENCY_WINDOW games, all games are
+    # "recent" and the formula collapses to a simple mean.
+
+    volume_cols = {
+        "goals":       "rolling_goals_avg",
+        "shots":       "rolling_shots_avg",
+        "points":      "rolling_points_avg",
+        "toi_minutes": "rolling_toi_avg",
+        "pp_goals":    "rolling_pp_goals_avg",
+    }
+
+    boost = RECENCY_WEIGHT - 1.0  # 0.5 with default config
+    n_recent = count_full.clip(upper=RECENCY_WINDOW)
+
+    for raw_col, new_col in volume_cols.items():
+        roll_full   = _rolling(raw_col, ROLLING_WINDOW, "mean")
+        roll_recent = _rolling(raw_col, RECENCY_WINDOW, "mean")
+
+        total_weight = count_full + n_recent * boost
+
+        result[new_col] = np.where(
+            total_weight > 0,
+            (roll_full * count_full + roll_recent * n_recent * boost)
+            / total_weight,
+            0.0,
+        )
+
+    # --- Efficiency metric: equal-weight over full window ---------------
+    goals_sum = _rolling("goals", ROLLING_WINDOW, "sum")
+    shots_sum = _rolling("shots", ROLLING_WINDOW, "sum")
+
+    result["rolling_shooting_pct"] = np.where(
+        shots_sum > 0,
+        goals_sum / shots_sum,
+        0.0,
     )
+
+    result["games_in_window"] = count_full
 
     return result
 
 
 def add_shooting_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Add shooting efficiency features.
+    Add shooting-derived features.
 
     New columns:
-    - rolling_shooting_pct: Goals / shots over the rolling window
     - shots_above_avg: How many more shots than their own average
 
-    💡 CONCEPT: Shooting percentage tells us about quality vs quantity.
-    A player getting 5 shots/game with 15% shooting is more likely
-    to score than one getting 2 shots/game at 8%.
+    NOTE: rolling_shooting_pct is now computed inside
+    add_rolling_averages() as an equal-weight efficiency metric
+    (50-game window, no recency boost).  Keeping it there avoids
+    accidentally deriving SH% from recency-weighted shot/goal
+    averages, which would defeat the purpose.
     """
     result = df.copy()
 
-    if "rolling_goals_avg" not in result.columns or "rolling_shots_avg" not in result.columns:
+    if "rolling_goals_avg" not in result.columns:
         result = add_rolling_averages(result)
-
-    # Rolling shooting percentage (avoid division by zero)
-    result["rolling_shooting_pct"] = np.where(
-        result["rolling_shots_avg"] > 0,
-        result["rolling_goals_avg"] / result["rolling_shots_avg"],
-        0.0,
-    )
 
     # Shots above their own rolling average (hot hand indicator)
     player_avg_shots = result.groupby("player_id")["shots"].transform("mean")
@@ -176,29 +217,39 @@ def add_streak_features(df: pd.DataFrame) -> pd.DataFrame:
     result = df.copy()
     result = result.sort_values(["player_id", "game_date"])
 
-    def _calc_streak(series: pd.Series) -> pd.Series:
-        """Count consecutive True values ending at each position."""
+    # Max gap between consecutive games before we reset streaks.
+    # Catches season breaks (~5 months) but not all-star breaks (~1 week).
+    MAX_STREAK_GAP_DAYS = 30
+
+    def _calc_streak(scored: pd.Series, dates: pd.Series) -> pd.Series:
+        """Count consecutive True values, resetting on season breaks."""
         streaks = []
         count = 0
-        for val in series:
-            if val:
-                count += 1
-            else:
-                count = 0
+        prev_date = None
+        for val, date in zip(scored, dates):
+            if prev_date is not None:
+                gap = (date - prev_date).days
+                if gap > MAX_STREAK_GAP_DAYS:
+                    count = 0
+            count = count + 1 if val else 0
             streaks.append(count)
-        return pd.Series(streaks, index=series.index)
+            prev_date = date
+        return pd.Series(streaks, index=scored.index)
 
-    def _calc_drought(series: pd.Series) -> pd.Series:
-        """Count consecutive False values (no goals) ending at each position."""
+    def _calc_drought(scored: pd.Series, dates: pd.Series) -> pd.Series:
+        """Count consecutive False values, resetting on season breaks."""
         droughts = []
         count = 0
-        for val in series:
-            if not val:
-                count += 1
-            else:
-                count = 0
+        prev_date = None
+        for val, date in zip(scored, dates):
+            if prev_date is not None:
+                gap = (date - prev_date).days
+                if gap > MAX_STREAK_GAP_DAYS:
+                    count = 0
+            count = count + 1 if not val else 0
             droughts.append(count)
-        return pd.Series(droughts, index=series.index)
+            prev_date = date
+        return pd.Series(droughts, index=scored.index)
 
     # Ensure 'scored' column exists
     if "scored" not in result.columns:
@@ -207,22 +258,28 @@ def add_streak_features(df: pd.DataFrame) -> pd.DataFrame:
     scored_bool = result["scored"].astype(bool)
     has_point = (result["points"] > 0) if "points" in result.columns else scored_bool
 
+    # Parse dates once for gap detection
+    dates = pd.to_datetime(result["game_date"])
+
     # Goal streak: shift by 1 so we see the streak ENTERING the game
     result["goal_streak"] = (
-        result.groupby("player_id")["scored"]
-        .transform(lambda x: _calc_streak(x.astype(bool)).shift(1).fillna(0))
+        result.groupby("player_id")
+        .apply(lambda g: _calc_streak(g["scored"].astype(bool), dates.loc[g.index]).shift(1).fillna(0))
+        .droplevel(0)
         .astype(int)
     )
 
     result["point_streak"] = (
-        result.groupby("player_id")[has_point.name if hasattr(has_point, 'name') else "points"]
-        .transform(lambda x: _calc_streak((x > 0) if x.dtype != bool else x).shift(1).fillna(0))
+        result.groupby("player_id")
+        .apply(lambda g: _calc_streak(g["points"] > 0, dates.loc[g.index]).shift(1).fillna(0))
+        .droplevel(0)
         .astype(int)
     )
 
     result["drought"] = (
-        result.groupby("player_id")["scored"]
-        .transform(lambda x: _calc_drought(x.astype(bool)).shift(1).fillna(0))
+        result.groupby("player_id")
+        .apply(lambda g: _calc_drought(g["scored"].astype(bool), dates.loc[g.index]).shift(1).fillna(0))
+        .droplevel(0)
         .astype(int)
     )
 
@@ -345,6 +402,8 @@ FEATURE_COLUMNS = [
     "shots_per_toi",
     "shooting_pct_trend",
     "high_volume_shooter",
+    # Power play production (recency-weighted volume)
+    "rolling_pp_goals_avg",
     # Player attributes
     "is_forward",
     "is_center",

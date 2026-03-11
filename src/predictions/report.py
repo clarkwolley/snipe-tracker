@@ -113,11 +113,15 @@ def generate_html_report(pred_df: pd.DataFrame, top_n: int = 30, game_df: pd.Dat
 
     # Streak indicator
     def _streak_badge(row):
+        parts = []
+        if row.get("sell_high", 0):
+            pdo = row.get("pdo", 0)
+            parts.append(f'<span class="streak-sell">📉 PDO {pdo:.0f}</span>')
         if row.get("is_hot", 0):
-            return f'<span class="streak-hot">🔥 {int(row.get("goal_streak", 0))}G</span>'
+            parts.append(f'<span class="streak-hot">🔥 {int(row.get("goal_streak", 0))}G</span>')
         if row.get("drought", 0) >= 5:
-            return f'<span class="streak-cold">❄️ {int(row.get("drought", 0))}G</span>'
-        return ""
+            parts.append(f'<span class="streak-cold">❄️ {int(row.get("drought", 0))}G</span>')
+        return " ".join(parts)
 
     display["streak_badge"] = display.apply(_streak_badge, axis=1)
     display["goalie_info"] = display.get("opp_goalie_name", pd.Series([""] * len(display)))

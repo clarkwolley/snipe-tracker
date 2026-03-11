@@ -10,6 +10,8 @@ that you can filter, sort, group, and do math on. Pandas DataFrames
 are the standard data structure in Python data science.
 """
 
+from datetime import date
+
 import pandas as pd
 from src.data import nhl_api
 
@@ -17,6 +19,10 @@ from src.data import nhl_api
 def get_todays_games() -> pd.DataFrame:
     """
     Get today's scheduled games as a clean DataFrame.
+
+    The NHL API /schedule/now endpoint returns an entire 7-day
+    gameWeek. We filter to only the current date so early-morning
+    runs do not accidentally pick up stale games from prior days.
 
     Returns:
         DataFrame with columns:
@@ -29,9 +35,12 @@ def get_todays_games() -> pd.DataFrame:
         - game_state: 'FUT' (future), 'LIVE', 'OFF' (final)
     """
     schedule = nhl_api.get_schedule()
+    today_str = date.today().isoformat()  # 'YYYY-MM-DD'
     games = []
 
     for day in schedule.get("gameWeek", []):
+        if day["date"] != today_str:
+            continue
         for game in day.get("games", []):
             games.append({
                 "game_id": game["id"],
@@ -86,10 +95,43 @@ def get_standings_df() -> pd.DataFrame:
             "road_wins": team["roadWins"],
             "road_losses": team["roadLosses"],
             "streak_code": team.get("streakCode", ""),
-            "pp_pct": team.get("powerPlayPctg", 0.20),
-            "pk_pct": team.get("penaltyKillPctg", 0.80),
+            # NOTE: pp_pct and pk_pct are NOT in the standings API.
+            # They get merged from the stats API below.
         })
 
+    df = pd.DataFrame(rows)
+
+    # Merge real PP% and PK% from the stats API.
+    # The standings endpoint doesn't include special teams data (!),
+    # so we pull it from api.nhle.com/stats which has the goods.
+    try:
+        special_teams = _get_special_teams_lookup()
+        df = df.merge(special_teams, on="team_name", how="left")
+        df["pp_pct"] = df["pp_pct"].fillna(0.20)
+        df["pk_pct"] = df["pk_pct"].fillna(0.80)
+    except Exception as e:
+        print(f"  ⚠️  Could not fetch special teams stats: {e}")
+        df["pp_pct"] = 0.20
+        df["pk_pct"] = 0.80
+
+    return df
+
+
+def _get_special_teams_lookup() -> pd.DataFrame:
+    """
+    Fetch real PP% and PK% from the NHL stats API.
+
+    Returns a small DataFrame with columns: team_name, pp_pct, pk_pct
+    that can be merged into standings by team_name.
+    """
+    data = nhl_api.get_team_stats_summary()
+    rows = []
+    for team in data.get("data", []):
+        rows.append({
+            "team_name": team["teamFullName"],
+            "pp_pct": team.get("powerPlayPct", 0.20),
+            "pk_pct": team.get("penaltyKillPct", 0.80),
+        })
     return pd.DataFrame(rows)
 
 
