@@ -300,7 +300,7 @@ def load_goal_model() -> tuple:
     return model, scaler, meta
 
 
-def predict_goal_probability(model, scaler, player_features: pd.DataFrame) -> np.ndarray:
+def predict_goal_probability(model, scaler, player_features: pd.DataFrame, meta: dict = None) -> np.ndarray:
     """
     Predict goal-scoring probability for players.
 

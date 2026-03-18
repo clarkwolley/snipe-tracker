@@ -16,6 +16,8 @@ Good features capture WHY a player might score tonight.
 import pandas as pd
 import numpy as np
 from src.config import ROLLING_WINDOW, RECENCY_WINDOW, RECENCY_WEIGHT, STREAK_MIN_GAMES
+from src.features.pdo_detector import add_pdo_features
+from src.features.powerplay_context import add_pp_context_features
 
 
 def parse_toi_to_minutes(toi_str: str) -> float:
@@ -378,7 +380,13 @@ def build_player_features(game_log: pd.DataFrame) -> pd.DataFrame:
     # Step 6: Position encoding
     df = add_position_encoding(df)
 
-    # Step 7: Home/away as numeric
+    # Step 7: PDO regression detection (identifies lucky players)
+    df = add_pdo_features(df)
+
+    # Step 8: Power play context (PP specialist flags)
+    df = add_pp_context_features(df)
+
+    # Step 9: Home/away as numeric
     df["is_home"] = df["is_home"].astype(int)
 
     return df
@@ -412,6 +420,14 @@ FEATURE_COLUMNS = [
     "opp_goalie_save_pct",
     "opp_goalie_gaa",
     "opp_goalie_quality",
+    # PDO regression detection (luck detection)
+    "pdo",
+    "is_regressing",
+    "regression_intensity",
+    "pdo_z_score",
+    # Power play context
+    "is_pp_specialist",
+    "pp_dependence",
 ]
 
 # What we're predicting

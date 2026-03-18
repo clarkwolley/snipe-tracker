@@ -169,9 +169,15 @@ def print_scorecard(graded: pd.DataFrame):
     """
     Pretty-print the grading results for a single day.
 
-    💡 CONCEPT: The scorecard shows you how calibrated the model is.
-    If the model says "70% chance" for 10 players, roughly 7 should
-    actually score. If only 2 do, the model is overconfident.
+    💡 CONCEPT: The scorecard shows how calibrated the model is.
+    For each confidence tier (50-60%, 60-70%, etc), we check:
+    - How many players we rated at that confidence
+    - How many actually scored
+    - Is the actual rate close to the predicted rate? (good calibration)
+    
+    Example: If we said "60% chance" for 10 players, we expect
+    ~6 to score. If 6 do, we're well-calibrated ✅. 
+    If only 2 score, we're overconfident 📉.
     """
     if graded.empty:
         print("No graded predictions to show.")
@@ -180,61 +186,94 @@ def print_scorecard(graded: pd.DataFrame):
     date = graded["prediction_date"].iloc[0]
     played = graded[graded["played"] == 1]
 
-    print(f"\n{'='*65}")
+    print(f"\n{'='*70}")
     print(f"📋 SCORECARD — {date}")
-    print(f"{'='*65}")
+    print(f"{'='*70}")
 
-    # Overall stats
+    # Simple overall stats
     total = len(played)
     actual_scorers = played["actual_scored"].sum()
-    predicted_scorers = played["predicted_goal"].sum()
-    hits = played["hit"].sum()
-    correct = played["correct"].sum()
+    avg_prob = played["goal_probability"].mean() * 100
+    brier = ((played["goal_probability"] - played["actual_scored"]) ** 2).mean()
 
-    print(f"  Players tracked:     {total}")
-    print(f"  Actually scored:     {actual_scorers}")
-    print(f"  We predicted goal:   {predicted_scorers}")
-    print(f"  Correct predictions: {correct}/{total} ({correct/max(total,1)*100:.1f}%)")
-    print(f"  Hits (predicted + scored): {hits}/{predicted_scorers} "
-          f"({hits/max(predicted_scorers,1)*100:.1f}% precision)")
+    print(f"  Players tracked:    {total}")
+    print(f"  Actually scored:    {actual_scorers}")
+    print(f"  Avg confidence:     {avg_prob:.1f}%")
+    print(f"  Brier score:        {brier:.4f}  (lower is better; 0=perfect)")
 
-    # Calibration by tier
+    # Calibration by tier — showing precision per tier
     print(f"\n  📊 CALIBRATION BY CONFIDENCE TIER:")
-    bins = [(0.72, 1.0, "🔥 FIRE  (72%+)"),
-            (0.68, 0.72, "🎯 STRONG (68-72%)"),
-            (0.64, 0.68, "👀 WATCH  (64-68%)"),
-            (0.0, 0.64, "📋 OTHER  (<64%)")]
+    print(f"  (For each tier, are actual scoring rates close to predicted?)\n")
+    
+    bins = [
+        (0.55, 1.0, "🔥 HIGH   (55%+)"),
+        (0.45, 0.55, "🎯 MID    (45-55%)"),
+        (0.35, 0.45, "👀 LOW    (35-45%)"),
+        (0.0, 0.35, "📋 MINIMAL (<35%)"),
+    ]
 
+    tier_results = []
     for lo, hi, label in bins:
         tier = played[(played["goal_probability"] >= lo) & (played["goal_probability"] < hi)]
         if tier.empty:
             continue
+        
         tier_scored = tier["actual_scored"].sum()
         tier_total = len(tier)
-        avg_prob = tier["goal_probability"].mean() * 100
-        actual_rate = tier_scored / tier_total * 100
-        print(f"    {label}: {tier_scored}/{tier_total} scored "
-              f"(predicted ~{avg_prob:.0f}%, actual {actual_rate:.0f}%)")
+        avg_pred_pct = tier["goal_probability"].mean() * 100
+        actual_pct = (tier_scored / tier_total * 100) if tier_total > 0 else 0
+        calibration_diff = actual_pct - avg_pred_pct
+        
+        # Emoji for calibration: ✅ if within ±8%, 📈 if underestimating, 📉 if overestimating
+        cal_emoji = "✅" if abs(calibration_diff) <= 8 else ("📈" if calibration_diff > 8 else "📉")
+        
+        tier_results.append({
+            "label": label,
+            "tier": tier,
+            "scored": tier_scored,
+            "total": tier_total,
+            "avg_pred": avg_pred_pct,
+            "actual": actual_pct,
+            "cal_emoji": cal_emoji,
+        })
+    
+    for res in tier_results:
+        print(f"    {res['label']}")
+        print(f"      Players:  {res['scored']}/{res['total']} scored ({res['actual']:.0f}%)")
+        print(f"      Expected: ~{res['avg_pred']:.0f}%  →  Actual: {res['actual']:.0f}%  {res['cal_emoji']}")
+        print()
 
-    # Top picks that hit
-    print(f"\n  ✅ TOP PICKS THAT HIT:")
-    top_hits = played[(played["actual_scored"] == 1)].nlargest(10, "goal_probability")
-    for _, row in top_hits.iterrows():
-        print(f"    ✅ {row['name']} ({row['team']}) — "
-              f"{row['goal_probability']*100:.0f}% predicted, "
-              f"{row['actual_goals']} goal(s), {row['actual_shots']} shots")
+    # Top scorers by confidence
+    print(f"  🏆 TOP SCORERS (ranked by our confidence):")
+    top_by_prob = played.nlargest(5, "goal_probability")
+    for rank, (_, row) in enumerate(top_by_prob.iterrows(), 1):
+        status = "✅" if row["actual_scored"] == 1 else "❌"
+        goals = int(row["actual_goals"])
+        shots = int(row["actual_shots"])
+        print(f"    {rank}. {status} {row['name']:25s} {row['goal_probability']*100:5.1f}% → {goals}G on {shots}S")
 
-    # Top picks that missed
-    print(f"\n  ❌ TOP PICKS THAT MISSED:")
-    top_misses = played[
-        (played["predicted_goal"] == 1) & (played["actual_scored"] == 0)
+    # Surprise scorers (high actual but low predicted) and duds (high pred, low actual)
+    print(f"\n  💥 SURPRISE SCORERS (low confidence, actually scored):")
+    surprise = played[
+        (played["goal_probability"] < 0.35) & (played["actual_scored"] == 1)
+    ].nlargest(5, "actual_goals")
+    if not surprise.empty:
+        for _, row in surprise.iterrows():
+            print(f"    🎁 {row['name']:25s} {row['goal_probability']*100:5.1f}% predicted → {int(row['actual_goals'])}G")
+    else:
+        print(f"    (none)")
+
+    print(f"\n  💔 HIGH CONFIDENCE MISSES (55%+, didn't score):")
+    duds = played[
+        (played["goal_probability"] >= 0.55) & (played["actual_scored"] == 0)
     ].nlargest(5, "goal_probability")
-    for _, row in top_misses.iterrows():
-        print(f"    ❌ {row['name']} ({row['team']}) — "
-              f"{row['goal_probability']*100:.0f}% predicted, "
-              f"{row['actual_shots']} shots but no goal")
+    if not duds.empty:
+        for _, row in duds.iterrows():
+            print(f"    ❌ {row['name']:25s} {row['goal_probability']*100:5.1f}% predicted → {int(row['actual_shots'])} shots, no goal")
+    else:
+        print(f"    (none)")
 
-    print(f"{'='*65}")
+    print(f"\n{'='*70}")
 
 
 def run_grading(date_str: str):
@@ -244,6 +283,8 @@ def run_grading(date_str: str):
         print_scorecard(graded)
         save_graded(graded)
     return graded
+
+
 
 
 def lifetime_stats():
@@ -263,45 +304,46 @@ def lifetime_stats():
 
     dates = played["prediction_date"].nunique()
     total = len(played)
+    actual_scorers = played["actual_scored"].sum()
+    avg_prob = played["goal_probability"].mean() * 100
 
-    print(f"\n{'='*65}")
+    print(f"\n{'='*70}")
     print(f"📈 LIFETIME MODEL PERFORMANCE")
-    print(f"{'='*65}")
-    print(f"  Days tracked:    {dates}")
-    print(f"  Total picks:     {total}")
-    print(f"  Actual scorers:  {played['actual_scored'].sum()}")
+    print(f"{'='*70}")
+    print(f"  Days tracked:     {dates}")
+    print(f"  Total picks:      {total}")
+    print(f"  Actual scorers:   {actual_scorers} ({actual_scorers/total*100:.1f}%)")
+    print(f"  Avg confidence:   {avg_prob:.1f}%")
 
-    predicted = played[played["predicted_goal"] == 1]
-    if len(predicted) > 0:
-        precision = predicted["actual_scored"].mean() * 100
-        print(f"  Predicted goals: {len(predicted)}")
-        print(f"  Hit rate:        {precision:.1f}% (of 'goal' predictions that scored)")
-
-    # Overall accuracy
-    accuracy = played["correct"].mean() * 100
-    print(f"  Accuracy:        {accuracy:.1f}%")
-
-    # Brier score over time
+    # Brier score (best metric for probability predictions)
     brier = ((played["goal_probability"] - played["actual_scored"]) ** 2).mean()
-    print(f"  Brier score:     {brier:.3f} (lower is better)")
+    print(f"  Brier score:      {brier:.4f} (lower is better; 0=perfect)")
 
-    # Calibration
-    print(f"\n  📊 OVERALL CALIBRATION:")
-    for lo, hi, label in [
-        (0.72, 1.0, "🔥 FIRE  (72%+)"),
-        (0.68, 0.72, "🎯 STRONG (68-72%)"),
-        (0.64, 0.68, "👀 WATCH  (64-68%)"),
-        (0.0, 0.64, "📋 OTHER  (<64%)"),
-    ]:
+    # Calibration by tier across all dates
+    print(f"\n  📊 CALIBRATION ACROSS ALL DAYS:")
+    print(f"  (Averaging calibration across {dates} days)\n")
+    
+    bins = [
+        (0.55, 1.0, "🔥 HIGH   (55%+)"),
+        (0.45, 0.55, "🎯 MID    (45-55%)"),
+        (0.35, 0.45, "👀 LOW    (35-45%)"),
+        (0.0, 0.35, "📋 MINIMAL (<35%)"),
+    ]
+
+    for lo, hi, label in bins:
         tier = played[(played["goal_probability"] >= lo) & (played["goal_probability"] < hi)]
         if tier.empty:
             continue
+        
         avg_pred = tier["goal_probability"].mean() * 100
         actual_rate = tier["actual_scored"].mean() * 100
         n = len(tier)
         diff = actual_rate - avg_pred
-        arrow = "✅" if abs(diff) < 10 else ("📈" if diff > 0 else "📉")
-        print(f"    {label}: predicted ~{avg_pred:.0f}% | actual {actual_rate:.0f}% "
-              f"| n={n} {arrow}")
+        
+        # Color code: well-calibrated if within ±8%
+        cal_emoji = "✅" if abs(diff) <= 8 else ("📈" if diff > 8 else "📉")
+        
+        print(f"    {label}")
+        print(f"      {n:4d} picks → Expected ~{avg_pred:.0f}% | Actual {actual_rate:.0f}% {cal_emoji}")
 
-    print(f"{'='*65}")
+    print(f"\n{'='*70}")

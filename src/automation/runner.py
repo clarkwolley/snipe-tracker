@@ -3,8 +3,13 @@ Daily automation runner for Snipe Tracker.
 
 Orchestrates the full daily pipeline:
 1. Grade yesterday's predictions (if any)
-2. Generate today's predictions
-3. Deliver results via email + Telegram
+2. Grade yesterday's bets (if any placed via Telegram)
+3. Generate today's predictions
+4. Deliver results via email + Telegram
+
+Betting is MANUAL via Telegram commands: /bet Pastrnak 50 -110 2026-03-20
+
+Grading and notification are FULLY AUTOMATED.
 
 Usage:
     python -m src.automation.runner              # Full daily run
@@ -53,31 +58,52 @@ def _setup_logging() -> logging.Logger:
 
 
 def step_grade_yesterday(log: logging.Logger) -> None:
-    """Grade yesterday's predictions against actual results."""
+    """Grade yesterday's predictions AND bets against actual results."""
     from src.predictions.tracker import grade_predictions, save_graded, print_scorecard
-    from src.notifications.telegram_sender import send_grade
+    from src.notifications.telegram_sender import send_grade, _send_message
+    from src.notifications.settings import load_settings
+    from src.automation.auto_grader import auto_grade_bets, format_grading_summary
 
     yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-    log.info(f"📊 Grading yesterday's predictions ({yesterday})...")
+    log.info(f"📊 Grading yesterday's predictions & bets ({yesterday})...")
 
+    # Grade predictions
     graded = grade_predictions(yesterday)
-    if graded.empty:
+    if not graded.empty:
+        print_scorecard(graded)
+        save_graded(graded)
+
+        # Send prediction grade via Telegram
+        try:
+            send_grade(graded)
+        except Exception as e:
+            log.warning(f"   Telegram prediction grade notification failed: {e}")
+    else:
         log.info("   No predictions to grade for yesterday.")
-        return
 
-    print_scorecard(graded)
-    save_graded(graded)
-
-    # Send grade via Telegram
+    # Grade bets (if any were placed via Telegram /bet commands)
     try:
-        send_grade(graded)
+        bet_results = auto_grade_bets(yesterday)
+        if bet_results.get("graded", 0) > 0:
+            summary = format_grading_summary(bet_results)
+            log.info(f"\n{summary}")
+            # Send bet grading summary via Telegram
+            settings = load_settings()
+            if settings.get("TELEGRAM_BOT_TOKEN") and settings.get("TELEGRAM_CHAT_ID"):
+                _send_message(
+                    settings["TELEGRAM_BOT_TOKEN"],
+                    settings["TELEGRAM_CHAT_ID"],
+                    summary
+                )
     except Exception as e:
-        log.warning(f"   Telegram grade notification failed: {e}")
+        log.warning(f"   Bet grading failed: {e}")
 
 
 def step_predict_today(log: logging.Logger) -> tuple:
     """
     Generate today's predictions and save the HTML report.
+
+    Betting is manual via Telegram: /bet Name Amount Odds Date
 
     Returns:
         (pred_df, game_df, report_path) — or (None, None, None) if no games.
@@ -111,6 +137,11 @@ def step_predict_today(log: logging.Logger) -> tuple:
     # Generate HTML report
     report_path = generate_html_report(pred_df, game_df=game_df)
     log.info(f"   Report saved: {report_path}")
+
+    log.info("\n💬 Ready for manual betting via Telegram!")
+    log.info("   Send: /bet Pastrnak 50 -110 2026-03-20")
+    log.info("   Send: /bet Matthews 60 -120 2026-03-20")
+    log.info("   (or use bot_server.py to accept /bet commands)")
 
     return pred_df, game_df, report_path
 
@@ -196,6 +227,13 @@ def check_status() -> None:
     )
     data_ok = os.path.exists(data_path)
     print(f"  📊 Data:     {'✅ collected' if data_ok else '❌ no data'}")
+
+    # Bets
+    bets_path = os.path.join(
+        os.path.dirname(__file__), "..", "..", "data", "bets.csv"
+    )
+    bets_ok = os.path.exists(bets_path)
+    print(f"  💰 Bets:     {'✅ tracking' if bets_ok else '❌ no bets yet'}")
 
     # Latest report
     latest = _find_latest_report()
