@@ -39,6 +39,92 @@ def _tier_class(prob: float) -> str:
     return "longshot"
 
 
+def _build_cheat_sheet_html(pred_df: pd.DataFrame, game_df: pd.DataFrame = None) -> str:
+    """Build a quick betting cheat sheet with top 5 picks and best games."""
+    top_5 = pred_df.head(5).copy()
+    top_5["prob_pct"] = (top_5["goal_probability"] * 100).round(1)
+    
+    # Build top 5 picks
+    picks_html = ""
+    for i, (_, row) in enumerate(top_5.iterrows(), 1):
+        prob = row["prob_pct"]
+        if prob >= 40:
+            tier_emoji = "🔥"
+            tier_color = "#ef4444"
+        elif prob >= 38:
+            tier_emoji = "🎯"
+            tier_color = "#f59e0b"
+        else:
+            tier_emoji = "👀"
+            tier_color = "#3b82f6"
+        
+        matchup = f"{'vs' if row['is_home'] else '@'} {row['opponent']}"
+        gpg = (row["season_goals"] / row["season_gp"]) if row["season_gp"] > 0 else 0
+        
+        picks_html += f"""        <div class="cheat-pick">
+            <div class="pick-rank">{i}</div>
+            <div class="pick-info">
+                <div class="pick-name">{row['name']} <span class="pick-team">{row['team']}</span></div>
+                <div class="pick-matchup">{matchup} • {gpg:.2f} GPG</div>
+            </div>
+            <div class="pick-prob" style="border-left: 4px solid {tier_color}">
+                <div class="pick-emoji">{tier_emoji}</div>
+                <div class="pick-percent">{prob:.1f}%</div>
+            </div>
+        </div>
+"""
+    
+    # Build top games (best game winner picks + best player picks)
+    games_html = ""
+    
+    if game_df is not None and not game_df.empty:
+        # Sort by confidence
+        top_games = game_df.nlargest(3, "confidence")
+        
+        for _, g in top_games.iterrows():
+            conf = g["confidence"]
+            if conf >= 60:
+                conf_icon = "🟢"
+                conf_label = "STRONG"
+            elif conf >= 55:
+                conf_icon = "🟡"
+                conf_label = "SLIGHT"
+            else:
+                conf_icon = "⚪"
+                conf_label = "LEAN"
+            
+            winner = g["predicted_winner"]
+            matchup = f"{g['away_team']} @ {g['home_team']}"
+            probs = f"{g['home_team']} {g['home_win_prob']}% | {g['away_team']} {g['away_win_prob']}%"
+            
+            games_html += f"""        <div class="cheat-game">
+            <div class="game-result">{conf_icon} <strong>{winner} wins</strong></div>
+            <div class="game-matchup">{matchup}</div>
+            <div class="game-probs">{probs}</div>
+        </div>
+"""
+    
+    return f"""    <section class="cheat-sheet">
+        <div class="cheat-header">
+            <h2>📋 BETTING CHEAT SHEET</h2>
+            <p>Top 5 picks + Best games. Copy these to your sportsbook.</p>
+        </div>
+        
+        <div class="cheat-grid">
+            <div class="cheat-column">
+                <h3>🎯 TOP 5 PLAYER PICKS</h3>
+{picks_html}
+            </div>
+            
+            <div class="cheat-column">
+                <h3>🏆 TOP GAMES (By Confidence)</h3>
+{games_html if games_html else '                <p style="color: #94a3b8; padding: 1rem;">No game data available</p>'}
+            </div>
+        </div>
+    </section>
+"""
+
+
 def _build_game_winner_html(game_df: pd.DataFrame) -> str:
     """Build HTML section for game winner predictions."""
     if game_df is None or game_df.empty:
@@ -81,7 +167,7 @@ def _build_game_winner_html(game_df: pd.DataFrame) -> str:
         </div>
 """
 
-    return f"""        <h2>🏆 Game Winner Predictions</h2>
+    return f"""        <h2>🏆 All Game Winner Predictions</h2>
         <div class="gw-grid">
 {rows_html}
         </div>"""
@@ -209,7 +295,8 @@ def generate_html_report(pred_df: pd.DataFrame, top_n: int = 30, game_df: pd.Dat
             padding: 2rem;
             line-height: 1.6;
         }}
-        .container {{ max-width: 1200px; margin: 0 auto; }}
+        .container {{ max-width: 1400px; margin: 0 auto; }}
+        
         header {{
             text-align: center;
             margin-bottom: 2rem;
@@ -221,6 +308,7 @@ def generate_html_report(pred_df: pd.DataFrame, top_n: int = 30, game_df: pd.Dat
         header h1 {{ font-size: 2.2rem; margin-bottom: 0.5rem; }}
         header .date {{ color: #94a3b8; font-size: 1.1rem; }}
         header .subtitle {{ color: #64748b; font-size: 0.9rem; margin-top: 0.5rem; }}
+        
         .disclaimer {{
             background: #1c1917;
             border: 1px solid #78350f;
@@ -230,6 +318,133 @@ def generate_html_report(pred_df: pd.DataFrame, top_n: int = 30, game_df: pd.Dat
             font-size: 0.85rem;
             color: #fbbf24;
         }}
+        
+        /* CHEAT SHEET STYLES */
+        .cheat-sheet {{
+            margin: 2.5rem 0;
+            background: linear-gradient(135deg, #1a1f35 0%, #0d1322 100%);
+            border: 2px solid #22c55e;
+            border-radius: 16px;
+            padding: 2rem;
+            box-shadow: 0 8px 32px rgba(34, 197, 94, 0.15);
+        }}
+        .cheat-header {{
+            text-align: center;
+            margin-bottom: 1.5rem;
+        }}
+        .cheat-header h2 {{
+            font-size: 1.8rem;
+            color: #22c55e;
+            margin-bottom: 0.5rem;
+        }}
+        .cheat-header p {{
+            color: #94a3b8;
+            font-size: 0.95rem;
+        }}
+        .cheat-grid {{
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 2rem;
+        }}
+        @media (max-width: 900px) {{
+            .cheat-grid {{ grid-template-columns: 1fr; }}
+        }}
+        
+        .cheat-column h3 {{
+            font-size: 1.2rem;
+            margin-bottom: 1rem;
+            color: #f1f5f9;
+            padding-bottom: 0.75rem;
+            border-bottom: 2px solid #334155;
+        }}
+        
+        .cheat-pick {{
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            background: #1a1f35;
+            border: 1px solid #2a3352;
+            border-radius: 10px;
+            padding: 0.75rem;
+            margin-bottom: 0.75rem;
+            transition: all 0.2s;
+        }}
+        .cheat-pick:hover {{
+            background: #1e293b;
+            border-color: #475569;
+        }}
+        .pick-rank {{
+            font-size: 1.5rem;
+            font-weight: 800;
+            color: #22c55e;
+            min-width: 30px;
+            text-align: center;
+        }}
+        .pick-info {{
+            flex: 1;
+        }}
+        .pick-name {{
+            font-weight: 700;
+            color: #f1f5f9;
+            font-size: 0.95rem;
+        }}
+        .pick-team {{
+            color: #94a3b8;
+            font-weight: 600;
+            margin-left: 0.5rem;
+        }}
+        .pick-matchup {{
+            font-size: 0.8rem;
+            color: #64748b;
+            margin-top: 0.25rem;
+        }}
+        .pick-prob {{
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.5rem 0.75rem;
+            background: #0f172a;
+            border-radius: 8px;
+            min-width: 80px;
+        }}
+        .pick-emoji {{
+            font-size: 1.3rem;
+        }}
+        .pick-percent {{
+            font-weight: 800;
+            font-size: 1.1rem;
+            color: #22c55e;
+        }}
+        
+        .cheat-game {{
+            background: #1a1f35;
+            border: 1px solid #2a3352;
+            border-radius: 10px;
+            padding: 0.75rem;
+            margin-bottom: 0.75rem;
+            transition: all 0.2s;
+        }}
+        .cheat-game:hover {{
+            background: #1e293b;
+            border-color: #475569;
+        }}
+        .game-result {{
+            font-weight: 700;
+            color: #f1f5f9;
+            font-size: 0.95rem;
+            margin-bottom: 0.3rem;
+        }}
+        .game-matchup {{
+            font-size: 0.85rem;
+            color: #94a3b8;
+            margin-bottom: 0.3rem;
+        }}
+        .game-probs {{
+            font-size: 0.8rem;
+            color: #64748b;
+        }}
+        
+        /* TABLE STYLES */
         table {{
             width: 100%;
             border-collapse: collapse;
@@ -274,12 +489,14 @@ def generate_html_report(pred_df: pd.DataFrame, top_n: int = 30, game_df: pd.Dat
         tr.strong .prob-bar {{ background: linear-gradient(90deg, #f59e0b, #d97706); }}
         tr.watch .prob-bar {{ background: linear-gradient(90deg, #3b82f6, #2563eb); }}
         .tier-badge {{ font-size: 0.8rem; white-space: nowrap; }}
+        
         h2 {{
             font-size: 1.4rem;
             margin: 2.5rem 0 1rem;
             padding-bottom: 0.5rem;
             border-bottom: 2px solid #1e293b;
         }}
+        
         .games-grid {{
             display: grid;
             grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
@@ -313,6 +530,7 @@ def generate_html_report(pred_df: pd.DataFrame, top_n: int = 30, game_df: pd.Dat
         .streak-hot {{ background: #7f1d1d; color: #fca5a5; padding: 2px 6px; border-radius: 4px; font-size: 0.8rem; font-weight: 600; }}
         .streak-cold {{ background: #1e3a5f; color: #93c5fd; padding: 2px 6px; border-radius: 4px; font-size: 0.8rem; font-weight: 600; }}
         .goalie-col {{ font-size: 0.85rem; color: #94a3b8; }}
+        
         .gw-grid {{
             display: grid;
             grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
@@ -335,6 +553,7 @@ def generate_html_report(pred_df: pd.DataFrame, top_n: int = 30, game_df: pd.Dat
         .gw-bar-home {{ background: #3b82f6; color: #fff; display: flex; align-items: center; justify-content: center; font-weight: 600; }}
         .gw-bar-away {{ background: #64748b; color: #fff; display: flex; align-items: center; justify-content: center; font-weight: 600; }}
         .gw-special-teams {{ font-size: 0.8rem; color: #94a3b8; margin-top: 0.5rem; text-align: center; }}
+        
         footer {{
             text-align: center;
             margin-top: 3rem;
@@ -357,7 +576,9 @@ def generate_html_report(pred_df: pd.DataFrame, top_n: int = 30, game_df: pd.Dat
             not absolute odds. Never bet more than you can afford to lose.
         </div>
 
-        <h2>🎯 Top {top_n} Most Likely Goal Scorers</h2>
+{_build_cheat_sheet_html(pred_df, game_df)}
+
+        <h2>🎯 Full Player Rankings (Top {top_n})</h2>
         <table>
             <thead>
                 <tr>

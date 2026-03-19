@@ -328,8 +328,14 @@ def predict_tonight() -> pd.DataFrame:
     else:
         pred_df["injury_note"] = ""
 
-    # 5. Fill any NaN features with 0 (new players without history)
-    pred_df[FEATURE_COLUMNS] = pred_df[FEATURE_COLUMNS].fillna(0)
+    # 5. Ensure all feature columns exist (create missing ones with defaults)
+    for col in FEATURE_COLUMNS:
+        if col not in pred_df.columns:
+            pred_df[col] = 0.0
+    
+    # Fill any NaN values in feature columns
+    existing_cols = [c for c in FEATURE_COLUMNS if c in pred_df.columns]
+    pred_df[existing_cols] = pred_df[existing_cols].fillna(0)
 
     # 6. Predict
     print("🎯 Running predictions...\n")
